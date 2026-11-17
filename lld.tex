@@ -1,0 +1,713 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=20mm,headheight=14pt]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+\usepackage{listings}
+\usepackage{titlesec}
+
+\definecolor{ehgreen}{HTML}{245B43}
+\definecolor{ehmint}{HTML}{EAF2ED}
+\definecolor{ehgray}{HTML}{56625B}
+\definecolor{ehline}{HTML}{D9E1DB}
+\hypersetup{colorlinks=true,linkcolor=ehgreen,urlcolor=ehgreen}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small EasyHousing | Low-Level Design}
+\rhead{\small Version 1.0}
+\cfoot{\thepage}
+\setlength{\parskip}{4pt}
+\setlength{\parindent}{0pt}
+\setlist[itemize]{leftmargin=17pt,itemsep=1pt,topsep=2pt}
+\setlist[enumerate]{leftmargin=19pt,itemsep=1pt,topsep=2pt}
+\titleformat{\section}{\Large\bfseries\color{ehgreen}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries\color{ehgray}}{\thesubsection}{0.7em}{}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\endpoint}[1]{\path{#1}}
+\newcommand{\field}[1]{\texttt{#1}}
+\newcommand{\pagebreakdoc}{\clearpage}
+
+\begin{document}
+\begin{titlepage}
+\centering
+\vspace*{19mm}
+{\color{ehgreen}\rule{\textwidth}{2pt}}\par
+\vspace{12mm}
+{\Huge\bfseries EasyHousing\par}
+\vspace{4mm}
+{\LARGE Low-Level Design\par}
+\vspace{5mm}
+{\large\color{ehgray}Service contracts, workflows, data model, and implementation details}\par
+\vspace{13mm}
+{\color{ehgreen}\rule{0.62\textwidth}{1pt}}\par
+\vspace{16mm}
+\begin{tabular}{rl}
+\textbf{Document type:} & Low-Level Design (LLD)\\
+\textbf{System:} & EasyHousing property discovery and listing platform\\
+\textbf{Backend:} & ASP.NET Core / .NET 8, Entity Framework Core\\
+\textbf{Frontend:} & Angular 22, TypeScript, RxJS, server-rendering support\\
+\textbf{Data:} & SQL Server (LocalDB in current development configuration)\\
+\textbf{Revision:} & 1.0\\
+\textbf{Prepared:} & November 2026\\
+\end{tabular}
+\vfill
+\begin{minipage}{0.88\textwidth}
+\small\color{ehgray}
+This document is based on the source and configuration present in the repository.
+All example ports and development behavior refer to the current local configuration.
+No production deployment, external payment flow, automated API test suite, or
+unimplemented infrastructure is implied.
+\end{minipage}
+\vspace{8mm}
+\end{titlepage}
+
+\tableofcontents
+\pagebreakdoc
+
+\section{Purpose, Scope, and Implementation Baseline}
+This Low-Level Design describes how EasyHousing's implemented frontend and backend
+parts cooperate. It is intended for developers who need to trace a UI action to an
+HTTP route, service method, data record, and response. The companion HLD describes
+system boundaries and quality attributes.
+
+\subsection{Repository layout}
+\begin{verbatim}
+EasyHousingSolution/
+|-- EasyHousingSolution.sln
+|-- backend/
+|   |-- backendd.sln
+|   |-- docs/                 (this document and HLD source)
+|   `-- services/
+|       |-- ApiGateway/       (src/Program.cs)
+|       |-- IdentityService/  (src/Controllers, Data, Domain, Services)
+|       |-- UserService/      (src/Controllers, Data, Domain)
+|       |-- PropertyService/  (src/Controllers, Data, Domain, Services)
+|       `-- CartService/      (src/Controllers, Data, Domain, Services)
+`-- frontend/
+    `-- src/app/
+        |-- core/             (configuration, models, guards, interceptors, clients)
+        `-- features/          (auth, buyer, seller, admin, shared)
+\end{verbatim}
+
+Each backend project keeps its \code{.csproj}, settings, and launch profile at the
+service root; application code is under \code{src/}. Each project is an independent
+ASP.NET Core web application targeting .NET 8. The frontend is a standalone Angular
+application with route-level feature components.
+
+\subsection{Runtime and configuration}
+\begin{tabularx}{\textwidth}{>{\bfseries}p{27mm} p{20mm} X}
+\toprule
+Process & Port & Important configuration\\
+\midrule
+Angular dev server & 4200 & \code{API_BASE_URL=http://localhost:5200/api}; local session in browser storage.\\
+API Gateway & 5200 & Downstream URLs in \code{Services:*}; CORS origin list.\\
+Identity Service & 5201 & Identity database, JWT issuer/audience/signing key, User Service URL, internal key.\\
+User Service & 5202 & User database, same JWT validation settings, same internal key.\\
+Property Service & 5203 & Property database, JWT settings, User Service URL and internal key.\\
+Cart Service & 5204 & Cart database, JWT settings, Property Service URL.\\
+\bottomrule
+\end{tabularx}
+Development launch profiles set \code{ASPNETCORE_ENVIRONMENT=Development}, which
+enables Swagger. The service defaults use LocalDB and development keys; production
+must replace these values with secure, environment-specific configuration.
+
+\subsection{Cross-cutting request processing}
+The gateway maps the first segment following \code{/api/} to a downstream base URL
+and streams request bodies and content headers. It copies status and response headers
+back to the caller. It does not own application authorization and currently contains
+no configured retry, circuit-breaker, or health-check behavior. Each service configures
+controllers, SQL Server EF Core, CORS, Swagger, and JWT validation as appropriate.
+API exception middleware maps selected service failures to JSON error responses.
+
+\pagebreakdoc
+\section{API Gateway and HTTP Contract Conventions}
+\subsection{Gateway routing table}
+\begin{tabularx}{\textwidth}{>{\ttfamily}p{42mm} >{\ttfamily}p{40mm} X}
+\toprule
+Public prefix & Downstream key & Service path behavior\\
+\midrule
+/api/identity/* & IdentityService & Path and query are forwarded unchanged.\\
+/api/locations/* & UserService & Public state/city endpoints.\\
+/api/properties/* & PropertyService & Search, seller, admin, image and detail endpoints.\\
+/api/cart/* & CartService & Buyer saved-home endpoints.\\
+\bottomrule
+\end{tabularx}
+An unknown prefix returns 404. Gateway configuration keys are loaded from
+\code{Services:IdentityService}, \code{Services:UserService},
+\code{Services:PropertyService}, and \code{Services:CartService}. The API gateway
+also serves a development Swagger UI and proxies each service's
+\code{/swagger/v1/swagger.json}.
+
+\subsection{Conventions}
+\begin{itemize}
+  \item JSON DTO properties are serialized using ASP.NET Core web JSON defaults
+  (camel case); TypeScript models use camel-case fields.
+  \item Authenticated browser calls receive \code{Authorization: Bearer <JWT>} from
+  the Angular HTTP interceptor when the URL is under the configured API origin.
+  \item Role-protected endpoints return the platform's standard ASP.NET Core
+  authorization outcomes; controllers additionally return explicit 400, 404, 409,
+  201, 200, or 204 outcomes where implemented.
+  \item Internal User Service calls pass \code{X-Internal-Api-Key}. Do not expose this
+  header or value to the browser.
+  \item Request cancellation tokens are passed through to EF Core and downstream HTTP
+  calls for the service operations inspected here.
+\end{itemize}
+
+\subsection{High-level route inventory}
+\begin{longtable}{p{24mm} p{69mm} p{44mm}}
+\toprule
+Service & Route(s) & Access\\
+\midrule
+\endhead
+Identity & \endpoint{POST /api/identity/register}; \endpoint{POST /api/identity/login} & Public\\
+User & \endpoint{GET /api/locations/states}; \endpoint{GET /api/locations/states/\{stateId\}/cities} & Public\\
+User & \endpoint{GET /api/internal/locations/resolve}; \endpoint{/api/internal/users*} & Internal API key\\
+Property & \endpoint{GET /api/properties/search}; \endpoint{GET /api/properties/\{id\}} & Public active/verified data\\
+Property & \endpoint{GET /api/properties/compare}; \endpoint{GET /api/properties/\{id\}/contact} & Buyer\\
+Property & \endpoint{POST /api/properties}; \endpoint{PUT /api/properties/\{id\}}; image upload; \endpoint{GET /api/properties/mine} & Seller\\
+Property & Pending, owner, region, verify, deactivate admin routes & Admin\\
+Cart & \endpoint{GET /api/cart}; \endpoint{POST /api/cart}; \endpoint{DELETE /api/cart/\{cartId\}} & Buyer\\
+\bottomrule
+\end{longtable}
+
+\pagebreakdoc
+\section{Identity Service: Accounts, Registration, and Login}
+\subsection{Responsibilities and persistence}
+Identity Service owns \code{IdentityAccount}: \field{IdentityAccountId} (primary key),
+\field{UserName}, \field{PasswordHash}, \field{UserType}, and \field{UserId}. EF Core
+enforces a unique index on username. Username and role lengths are capped at 25 and
+15 characters; the hash column is capped at 500 characters. \field{UserId} is the
+profile identifier in User Service, not a cross-database foreign key.
+
+\subsection{Registration contract}
+\begin{tabularx}{\textwidth}{>{\bfseries}p{36mm} X}
+\toprule
+Field & Validation / meaning\\
+\midrule
+\field{userName} & Required, 1--25 characters; trimmed before account creation.\\
+\field{password} & Required, 8--25 characters; hashed by ASP.NET Core PasswordHasher.\\
+\field{userType} & Exactly Buyer or Seller; Admin registration is not accepted.\\
+\field{firstName}, \field{lastName} & First name required, each at most 25 characters.\\
+\field{emailId} & Required valid email, at most 50 characters.\\
+\field{phoneNo} & Required exactly ten digits.\\
+\field{dateOfBirth} & Date in the past; checked by controller.\\
+\field{address}, \field{stateId}, \field{cityId} & Seller profile requires address and valid state/city selection.\\
+\bottomrule
+\end{tabularx}
+The route first checks username existence and account type/date constraints. Identity
+then sends a profile creation request to User Service. User Service additionally
+checks duplicate username/email and, for sellers, verifies that the city belongs to
+the selected state. On profile success, Identity hashes the password and saves the
+account. A database update conflict triggers a compensating delete of the profile
+and returns a username conflict response. This is a small synchronous compensation,
+not a distributed transaction; email-uniqueness conflict behavior should be verified
+against the exact exception path if the registration contract is changed.
+
+\subsection{Login and token contract}
+Login selects the account by trimmed username and verifies the submitted password
+with the stored hash. Unknown account or incorrect password returns 401 with a
+generic message. Successful login returns:
+\begin{verbatim}
+{
+  "userName": "seller.name",
+  "userType": "Seller",
+  "profileId": 123,
+  "token": "<signed JWT>"
+}
+\end{verbatim}
+The JWT uses HMAC SHA-256 with configured signing key; claims include subject, name,
+role, and custom \field{profileId}. Expiration is eight hours. Services validate
+issuer, audience, signing key, lifetime, and a 30-second clock skew. The local admin
+account is seeded at startup only if absent and uses a development password; replace
+or disable it for any shared deployment.
+
+\subsection{Identity error mapping}
+Argument validation exceptions are returned as 400. A downstream/operation
+\code{InvalidOperationException} is logged as a warning and returned as 502 with a
+registration-availability message. Unexpected exceptions are logged and returned as
+500. Explicit controller responses include duplicate username 409 and invalid login
+401. Error JSON uses a \field{Message} property; frontend code may also accept
+lower-case \field{message} from proxied components.
+
+\pagebreakdoc
+\section{User Service: Profiles and Locations}
+\subsection{Owned tables}
+\begin{longtable}{>{\bfseries}p{28mm} p{41mm} p{79mm}}
+\toprule
+Entity & Key fields & Constraints and relationships\\
+\midrule
+\endhead
+\field{UserProfile} & \field{UserId} PK; username, role, names, date of birth, phone, email, optional address/state/city & Unique username and email; optional State and City references; seller location is mandatory at create time.\\
+\field{State} & \field{StateId} PK; \field{StateName} & State name max 30; one-to-many City relationship.\\
+\field{City} & \field{CityId} PK; \field{CityName}; \field{StateId} FK & City name max 50; referenced State delete is restricted.\\
+\bottomrule
+\end{longtable}
+User profile first/last names are capped at 25 characters; email max 50, username
+max 25. User Service database startup seeds Gujarat, Maharashtra, Karnataka and
+Ahmedabad, Surat, Mumbai, Pune, Bengaluru. Seeding checks for existing rows before
+adding; the initial catalog is deliberately small and is not an exhaustive
+geographic reference dataset.
+
+\subsection{Location endpoints}
+\begin{longtable}{p{38mm} p{22mm} p{74mm}}
+\toprule
+Endpoint & Status & Behavior\\
+\midrule
+\endhead
+\endpoint{GET /api/locations/states} & 200 & State IDs and names ordered by name.\\
+\endpoint{GET /api/locations/states/\{stateId\}/cities} & 200 & City IDs, names, and state IDs for the selected state, ordered by city name.\\
+\endpoint{GET /api/internal/locations/resolve?stateId=\&cityId=} & 200/401/404 & Internal-key check; confirms selected city is in selected state; returns normalized region.\\
+\bottomrule
+\end{longtable}
+The property submission stores both state and city IDs and a resolved region string.
+This allows filtering by region while preserving normalized identifiers in property
+data. If a location no longer resolves, Property Service maps the not-found result
+to a client validation error.
+
+\subsection{Internal profile/contact endpoints}
+\begin{longtable}{p{38mm} p{22mm} p{74mm}}
+\toprule
+Endpoint & Status & Behavior\\
+\midrule
+\endhead
+\endpoint{POST /api/internal/users} & 200/400/401/409 & Internal key; creates buyer/seller profile and returns \field{userId}.\\
+\endpoint{DELETE /api/internal/users/\{userId\}} & 204/401/404 & Internal key; used for registration compensation.\\
+\endpoint{GET /api/internal/users/\{userId\}/contact} & 200/401/404 & Internal key; returns owner name, email, and phone.\\
+\bottomrule
+\end{longtable}
+The internal-key comparison is ordinal and expects the configured
+\code{InternalApiKey}. Unauthorized internal calls return 401. API exception
+middleware logs unhandled errors and emits a generic JSON 500. Avoid logging
+credentials, access tokens, or the internal key when diagnosing failures.
+
+\subsection{Account/profile relationship}
+The Identity account stores the profile ID returned by User Service. Registration
+therefore creates the User Service row before the Identity row. User Service is the
+source of truth for contact fields; Identity is the source of truth for credentials
+and role. Property and cart services use profile IDs from the JWT to associate
+records without direct database joins.
+
+\pagebreakdoc
+\section{Property Service: Listing Lifecycle and Query Rules}
+\subsection{Property aggregate}
+\field{PropertyListing} owns its \field{PropertyImage} collection.
+\begin{longtable}{>{\bfseries}p{32mm} p{39mm} p{75mm}}
+\toprule
+Group & Fields & Rules / meaning\\
+\midrule
+\endhead
+Identity & PropertyId, SellerId & Property ID is local PK; SellerId is a User Service profile ID.\\
+Listing & PropertyName, PropertyType, PropertyOption, Description & Name max 50; type max 15; option Sell/Rent; description max 250.\\
+Location & Address, Region, StateId, CityId, Landmark & Address max 250; landmark max 25; region is resolved from User Service.\\
+Pricing & PriceRange, InitialDeposit & Decimal precision 18,2; price must be positive; deposit non-negative.\\
+Lifecycle & Status, IsActive, DeactivationReason, CreatedAtUtc & New listing pending/inactive; timestamps initialized in UTC.\\
+Images & ImageId, PropertyId, Image, ContentType & Child rows; cascade delete with property.\\
+\bottomrule
+\end{longtable}
+
+\subsection{State transitions}
+\begin{center}
+\begin{tikzpicture}[
+  state/.style={draw=ehgreen,fill=ehmint,rounded corners,minimum width=27mm,
+    minimum height=10mm,align=center,font=\small},
+  edge/.style={-{Stealth[length=2mm]},thick,draw=ehgreen}
+]
+\node[state] (pending) {Pending\\inactive};
+\node[state,right=35mm of pending] (verified) {Verified\\active};
+\node[state,below=18mm of verified] (deactivated) {Deactivated\\inactive};
+\draw[edge] (pending) -- node[above,align=center,font=\scriptsize]{Admin verify} (verified);
+\draw[edge] (verified) -- node[right,align=left,font=\scriptsize]{Admin deactivate\\with reason} (deactivated);
+\draw[edge] (verified) to[bend left=28] node[above,align=center,font=\scriptsize]{Seller edit: reset to Pending/inactive} (pending);
+\draw[edge] (deactivated) to[bend right=25] node[below,align=center,font=\scriptsize]{Seller edit: reset to Pending/inactive} (pending);
+\end{tikzpicture}
+\end{center}
+Public search and detail endpoints require both \field{Status = Verified} and
+\field{IsActive = true}. Seller \code{mine} has a verified/active filter when
+\code{status=Verified}; otherwise it returns non-verified or inactive records.
+Admin pending returns records whose status is Pending. Admin region/owner lookup
+returns matching records and includes their image collections.
+
+\subsection{Property validation and service integration}
+Create and update accept a JSON \field{PropertySubmission}. Data annotations enforce
+many lengths/ranges; controller validation also rejects whitespace values, unsupported
+Sell/Rent values, invalid state/city IDs, non-positive price, negative deposit, and
+descriptions over 250 characters. The User Directory Client adds
+\code{X-Internal-Api-Key} and resolves the location before persistence.
+
+Seller identity comes from the JWT \field{profileId} claim; it is not accepted from
+the body. Update selects by both property ID and authenticated seller ID. Admin
+verification changes lifecycle flags; deactivation requires a non-empty reason of
+at most 250 characters. The current admin region/owner endpoints use their Admin
+role attribute.
+
+\subsection{Property endpoint detail}
+\begin{longtable}{p{45mm} p{21mm} p{68mm}}
+\toprule
+Endpoint & Access & Contract summary\\
+\midrule
+\endhead
+\endpoint{GET /api/properties/search} & Public & Optional region/type/option/sortBy; active verified listings; includes images.\\
+\endpoint{GET /api/properties/\{id\}} & Public & Single active verified property with images; otherwise 404.\\
+\endpoint{GET /api/properties/compare?id1=\&id2=} & Buyer & Two distinct positive IDs; returns two active verified records or 400/404.\\
+\endpoint{GET /api/properties/\{id\}/contact} & Buyer & Resolves seller profile and requests owner contact from User Service.\\
+\endpoint{POST /api/properties} & Seller & Creates Pending listing; 201 with ID and message.\\
+\endpoint{PUT /api/properties/\{id\}} & Seller & Updates own listing, resets it to pending/inactive; 204.\\
+\endpoint{GET /api/properties/mine} & Seller & Lists seller-owned verified or non-verified/inactive properties.\\
+\endpoint{GET /api/properties/admin/pending} & Admin & Pending moderation queue ordered by creation time.\\
+\endpoint{PUT /api/properties/admin/\{id\}/verify} & Admin & Activates and verifies; 204.\\
+\endpoint{PUT /api/properties/admin/\{id\}/deactivate} & Admin & Deactivates with required reason; 204.\\
+\bottomrule
+\end{longtable}
+
+\pagebreakdoc
+\section{Property Service: Image Upload and Delivery}
+\subsection{Upload contract}
+The seller UI creates a \code{FormData} and appends every selected file under the
+field name \code{files}. It posts to
+\endpoint{POST /api/properties/\{propertyId\}/images} with the seller JWT. The
+controller uses multipart model binding to receive \code{List<IFormFile>}; no
+explicit multipart Content-Type should be set by the frontend because the browser
+must supply the boundary.
+
+\begin{tabularx}{\textwidth}{>{\bfseries}p{42mm} X}
+\toprule
+Rule & Current implementation\\
+\midrule
+Ownership & Property must exist and its \field{SellerId} must equal JWT \field{profileId}; otherwise 404.\\
+Cardinality & At least one selected file; total image count after upload must not exceed six.\\
+Per-file size & Greater than zero and at most 5,000,000 bytes.\\
+MIME allowlist & \code{image/jpeg}, \code{image/png}, \code{image/webp}; this checks declared Content-Type.\\
+Request size & Action allows up to 32,000,000 bytes.\\
+Persistence & File bytes and Content-Type are written to Property Service's SQL database as child image rows.\\
+Success & 200 with a message; seller UI reloads listing data after upload.\\
+\bottomrule
+\end{tabularx}
+
+\subsection{Read path and browser rendering}
+Search/details/seller/admin queries eagerly load the \field{Images} navigation.
+Property Service serializes each image into \field{imageId}, Base64 \field{image},
+and \field{contentType}. Cart's downstream Property DTO mirrors this shape, allowing
+saved homes to render the same image. The frontend shared
+\code{propertyImageUrl()} helper:
+\begin{enumerate}
+  \item Returns the placeholder when no image data is present.
+  \item Preserves already-formed data, HTTP(S), protocol-relative, and non-Base64
+  site-relative paths.
+  \item Wraps Base64 content in a \code{data:<mime>;base64,<payload>} URL, preserving
+  JPEG/PNG/WebP content types.
+\end{enumerate}
+Image-bearing views bind the result to an HTML \code{img src}. This matters because
+Angular's CSS style sanitization and slash-prefixed Base64 payloads can otherwise
+turn a valid image into a blocked style or bogus site path. Actual image elements
+also preserve intrinsic image decoding behavior while CSS \code{object-fit: cover}
+handles cropping.
+
+\subsection{Operational and security considerations}
+At maximum limits, a property may store 30 MB of raw image payload before database
+and Base64/JSON overhead. Search can therefore return large responses, and six files
+may exceed the action request limit depending on their combined sizes. The allowlist
+validates the client-declared MIME type only; production hardening should inspect
+file signatures, apply upload rate and request limits, consider image re-encoding,
+and serve thumbnails from object storage or a dedicated media endpoint. Current
+support stores bytes in SQL and does not implement image deletion, reordering,
+thumbnails, virus scanning, or signed download URLs.
+
+\subsection{Image failure triage}
+\begin{enumerate}
+  \item Check upload response status and exact multipart field name \code{files}.
+  \item Confirm listing ownership, total image count, file length, and allowed MIME type.
+  \item Read a seller/admin listing response and confirm \field{images} is non-empty
+  and every item has \field{image} and \field{contentType}.
+  \item Confirm the browser source starts with \code{data:image/<type>;base64,} for
+  Base64 data, not \code{/9j/...} as a relative URL.
+  \item Check the actual image's browser \field{naturalWidth} and \field{naturalHeight};
+  a non-empty string alone does not prove successful image decoding.
+\end{enumerate}
+
+\pagebreakdoc
+\section{Cart Service: Saved Homes}
+\subsection{Persistence model}
+\field{SavedProperty} has \field{CartId} primary key, \field{BuyerId},
+\field{PropertyId}, and UTC \field{AddedAtUtc}. EF Core enforces a unique composite
+index on buyer/property. IDs are local references; the Cart database does not
+foreign-key into the Property or User database.
+
+\subsection{Cart operations}
+\begin{longtable}{p{42mm} p{20mm} p{68mm}}
+\toprule
+Endpoint & Access & Behavior\\
+\midrule
+\endhead
+\endpoint{GET /api/cart} & Buyer & Selects current buyer's rows newest first; resolves each property over HTTP; returns nullable property DTO.\\
+\endpoint{POST /api/cart} & Buyer & Validates positive property ID; resolves public property; rejects missing or duplicate; persists the reference; returns 201.\\
+\endpoint{DELETE /api/cart/\{cartId\}} & Buyer & Deletes only a row owned by current buyer; 404 if absent; otherwise 204.\\
+\bottomrule
+\end{longtable}
+Buyer identity is taken from JWT \field{profileId}. A property not found/active at
+add-time is rejected. During list retrieval, a missing property is represented as a
+null property, preserving the saved row so the buyer can remove it. Cart exception
+middleware maps missing downstream connectivity to 502 and logs it; unexpected
+failures become generic 500 responses.
+
+\subsection{Dependency and consistency characteristics}
+Cart reads are N+1 synchronous downstream requests: one SQL query for saved items,
+followed by one property HTTP request per row. This is simple and returns current
+property state/images but makes latency and availability depend on Property Service.
+There is no bulk property endpoint or cache in the current implementation. If cart
+size grows, prefer a bounded batch endpoint and explicit behavior for unavailable
+properties; do not silently return stale copied property data without a consistency
+policy.
+
+\section{Angular Frontend: Routes, Services, and State}
+\subsection{Route and role model}
+\begin{tabularx}{\textwidth}{>{\ttfamily}p{29mm} p{30mm} X}
+\toprule
+Route & Access & Main component\\
+\midrule
+/search & Public & Search and filter verified listings.\\
+/property/:id & Public & Listing details; buyer-only contact action.\\
+/login, /register & Public & Login and buyer/seller registration.\\
+/compare, /cart & Buyer & Compare two listings; manage saved homes.\\
+/seller & Seller & Seller listing form, listing status and photo upload.\\
+/admin & Admin & Pending verification and property moderation.\\
+/error & Public & Shared error view; unknown paths redirect here.\\
+\bottomrule
+\end{tabularx}
+Angular route guards improve navigation and UX, but service-side
+\code{[Authorize(Roles=...)]} is the actual authorization boundary.
+
+\subsection{Core client responsibilities}
+\begin{itemize}
+  \item \service{AuthService} calls login/register, persists the returned session and
+  token in local storage, exposes the current session as an Angular signal, and clears
+  it on logout.
+  \item \service{PropertyService} centralizes property, compare, contact, cart,
+  seller, and admin HTTP operations. Image upload uses \code{FormData}.
+  \item \service{LocationService} requests state and state-specific city lists.
+  \item \service{AuthInterceptor} adds Bearer credentials to requests matching the
+  configured API base URL in a browser context; it does not add local storage tokens
+  during server-side rendering.
+  \item \service{ErrorInterceptor} routes network, server, and selected not-found
+  errors to a shared page, with property search excluded for inline error display.
+  \item \service{propertyImageUrl} converts the service DTO's image representation
+  into a browser-usable URL and supplies the public placeholder when absent.
+\end{itemize}
+
+\subsection{UI-to-service flow map}
+\begin{tabularx}{\textwidth}{>{\bfseries}p{30mm} p{47mm} X}
+\toprule
+User action & Angular entry point & Backend operation\\
+\midrule
+Search homes & Search component / PropertyService & Public Property search via gateway.\\
+Register & Register component / AuthService & Identity register; internal User profile create.\\
+Open location selector & Registration/seller + LocationService & User states and cities.\\
+Create/edit listing & Seller dashboard / PropertyService & Seller-protected property POST/PUT.\\
+Upload photos & Seller dashboard / PropertyService & Seller multipart upload; reload seller lists.\\
+Verify/deactivate & Admin dashboard / PropertyService & Admin moderation routes.\\
+Contact seller & Property details / PropertyService & Buyer contact route; Property asks User.\\
+Save/remove & Search/details/cart / PropertyService & Buyer-protected Cart POST/GET/DELETE.\\
+\bottomrule
+\end{tabularx}
+
+\subsection{Session lifecycle}
+After login, \code{AuthService} stores JSON session under \code{ehs_user} and the
+JWT under \code{ehs_token}; the signal is updated so the navbar and guards can react.
+On application initialization it reads local storage only in a browser platform.
+Logout removes both keys and navigates to login. This is a bearer-token SPA pattern;
+storage choice is a security trade-off, and token revocation/refresh is not implemented.
+
+\pagebreakdoc
+\section{Data Contracts, Validation, and Error Semantics}
+\subsection{Property response shape}
+Property JSON contains \field{propertyId}, \field{propertyName},
+\field{propertyType}, \field{propertyOption}, \field{description}, \field{address},
+\field{region}, \field{stateId}, \field{cityId}, \field{priceRange},
+\field{initialDeposit}, \field{landmark}, \field{isActive},
+\field{deactivationReason}, \field{status}, \field{sellerId}, and \field{images}.
+Each image contains \field{imageId}, Base64 \field{image}, and \field{contentType}.
+The cart embeds this property DTO in \field{property}; the field is nullable when the
+referenced listing is unavailable.
+
+\subsection{Status code guidance}
+\begin{longtable}{p{20mm} p{58mm} p{72mm}}
+\toprule
+Status & Meaning in the current API & Typical source\\
+\midrule
+\endhead
+200 & Query or upload succeeded & Search, detail, location lists, image upload.\\
+201 & New resource created & Account registration or property/cart creation (response shape varies).\\
+204 & Mutation succeeded without body & Property update, remove cart item, profile compensation.\\
+400 & Malformed/invalid business request & Validation, invalid compare pair, image constraints.\\
+401 & Authentication or internal-key required/invalid & Invalid login, missing role token, internal route access.\\
+403 & Authenticated role lacks permission & ASP.NET Core authorization policy outcome.\\
+404 & Requested resource is not available & Property/profile/cart item lookup.\\
+409 & Duplicate data conflict & Username/email or duplicate saved property.\\
+502 & Downstream service unavailable/failure & Identity profile workflow or Cart property dependency.\\
+500 & Unexpected server error & Service exception middleware.\\
+\bottomrule
+\end{longtable}
+Exact serialization can vary by the framework layer; API callers should display safe
+messages, not rely on exception text or internal stack details.
+
+\subsection{Validation boundaries}
+Angular reactive forms provide immediate field validation, but clients are not
+trusted. Backend annotations and explicit controller checks remain authoritative.
+Seller property IDs are constrained by owner ID from the token. Cart IDs are
+constrained by buyer ID from the token. The frontend's route guard is not a substitute
+for either rule. Internal keys are checked only in User Service internal routes.
+
+\section{Security, Logging, and Failure Handling}
+\subsection{Security controls present in code}
+\begin{itemize}
+  \item Password hashes use ASP.NET Core's password hasher.
+  \item JWT validation covers issuer, audience, signing key, and lifetime; role-based
+  authorization is attached to protected controllers/actions.
+  \item Seller ownership and buyer cart ownership are checked server-side.
+  \item User profile/contact/internal location routes require a shared internal API key.
+  \item CORS origins are configured as \code{http://localhost:4200} for local runs.
+  \item Property uploads constrain count, per-file length, and declared MIME type.
+\end{itemize}
+
+\subsection{Security gaps / production hardening items}
+Development secrets and default admin credentials are present in local configuration
+and must not be used in production. Configure secret rotation, TLS, secure cookie
+or other token-storage strategy, strict request and upload limits at every hop,
+content-signature checks/re-encoding for images, rate limiting, and security headers.
+The internal API key is a shared secret and should be rotated and restricted to
+service network paths. Review personal contact-data access and audit events for
+privacy requirements. No refresh token, token revocation, MFA, or policy-based
+fine-grained access model is implemented.
+
+\subsection{Error and dependency behavior}
+Identity middleware translates argument errors to 400, selected invalid operations
+to 502, and unexpected errors to 500. Cart middleware translates
+\code{HttpRequestException} to 502, unauthorized access to 401, and other failures
+to 500. User and Property middleware log unexpected exceptions and return a generic
+500. Property's User Directory Client maps unresolved city selection to a user-facing
+argument error and missing contact to not-found. The gateway streams downstream
+status and response content; callers should preserve useful status semantics.
+
+No retry/circuit-breaker policy is configured in the inspected HTTP clients. Blind
+retries on non-idempotent operations can create duplicates or ambiguous outcomes;
+add retry logic only with idempotency and appropriate timeout policies.
+
+\pagebreakdoc
+\section{Startup, Database Initialization, and Operations}
+\subsection{Startup behavior}
+Each service registers its DbContext, SQL Server connection string, CORS, controllers,
+and (where applicable) JWT authentication and authorization. Services expose
+development Swagger. On startup, each creates a DI scope and calls
+\code{Database.EnsureCreatedAsync()}. User Service seeds its initial location
+catalog; Identity Service seeds the admin if no admin account exists. There are no
+EF migration bundles or startup schema version checks in the current code.
+
+\subsection{Local startup procedure}
+From the solution root, use separate PowerShell terminals:
+\begin{verbatim}
+dotnet run --project backend\services\UserService\UserService.csproj --launch-profile http
+dotnet run --project backend\services\IdentityService\IdentityService.csproj --launch-profile http
+dotnet run --project backend\services\PropertyService\PropertyService.csproj --launch-profile http
+dotnet run --project backend\services\CartService\CartService.csproj --launch-profile http
+dotnet run --project backend\services\ApiGateway\ApiGateway.csproj --launch-profile http
+\end{verbatim}
+Then start the browser application from \code{frontend} with \code{npm start}. SQL
+Server LocalDB and .NET 8 SDK must be installed. The frontend supports an optimized
+build via \code{npm run build}; unit tests use \code{npm test -- --watch=false}.
+
+\subsection{Health and diagnostics}
+The gateway currently has no dedicated health endpoint. Service liveness can be
+checked by contacting each host and its Swagger/API surface in Development; Swagger
+availability is not a production health check. Logs use ASP.NET Core logging defaults
+with Microsoft framework logs reduced to Warning in the JSON configuration. Add
+correlation IDs, structured business-operation logs, redaction, health/readiness
+checks, metrics, and central collection before operating multiple replicas.
+
+\section{Test Strategy and Extension Points}
+\subsection{Tests in the current repository}
+The Angular project contains a small Vitest suite: application rendering,
+registration validation, and image URL construction. The backend projects currently
+have no checked-in dedicated unit, integration, or API test projects. The backend
+directory layout intentionally leaves room for a service-local \code{tests/}
+directory as API tests are introduced; no test folder is claimed to exist yet.
+
+\subsection{Recommended test layers}
+\begin{enumerate}
+  \item \textbf{Unit:} property lifecycle transitions, request validation, claim parsing,
+  registration compensation decisions, image URL classification.
+  \item \textbf{Service integration:} controller + EF Core against a disposable SQL
+  database; verify unique constraints, image rows, state/city constraints, and owner
+  isolation.
+  \item \textbf{HTTP contract:} gateway route mapping, JWT role behavior, response
+  status and JSON casing, multipart boundary and image MIME payload.
+  \item \textbf{End-to-end:} register seller, create listing, upload photo, admin
+  verify, search as visitor, inspect image, save as buyer, remove saved item.
+  \item \textbf{Failure:} downstream timeout/unavailability, oversized request,
+  malformed image bytes, invalid token/role, duplicate request and cancellation.
+\end{enumerate}
+
+\subsection{API test checkpoints}
+\begin{tabularx}{\textwidth}{>{\bfseries}p{34mm} X}
+\toprule
+Scenario & Measurable expected result\\
+\midrule
+Image upload & 200, image count persisted, matching content type, returned listing includes Base64 payload.\\
+Unauthorized upload & 401/403; no image row is inserted.\\
+Cross-seller update/upload & Target property cannot be modified by a different seller.\\
+Pending listing search & Pending or inactive property is absent from public search/detail.\\
+Verification & Verified and active property appears in public search.\\
+Cart duplicate & Second save for same buyer/property returns conflict and creates no second row.\\
+Wrong city/state & Property submission is rejected before listing is persisted.\\
+Image UI & Browser image source is valid data URL and decoded dimensions are non-zero.\\
+\bottomrule
+\end{tabularx}
+
+\section{Known Limitations and Future Design Work}
+\begin{enumerate}
+  \item \textbf{Image transport/storage:} SQL BLOB + Base64 response is easy to reason
+  about locally but causes response amplification. Introduce object storage and
+  thumbnails once usage warrants it.
+  \item \textbf{Search scale:} Add pagination, bounded image metadata, indexes based
+  on query plans, and explicit search limits before catalog growth.
+  \item \textbf{Cart fan-out:} Replace per-item property fetches with a batch lookup
+  or a deliberate cache policy if observed latency is unacceptable.
+  \item \textbf{Schema evolution:} Introduce EF Core migrations with backups and
+  deployment ordering; do not rely on \code{EnsureCreatedAsync()} for evolving
+  long-lived production databases.
+  \item \textbf{API resilience:} Add explicit timeouts, resilience policies, request
+  size limits, and downstream health/readiness reporting. Preserve idempotency.
+  \item \textbf{API contract governance:} Add generated OpenAPI clients or contract
+  tests for the manually duplicated property DTO used by Cart Service.
+  \item \textbf{Operational security:} Move secrets out of appsettings, rotate
+  internal keys, protect the default admin, enforce HTTPS, and define audit/retention
+  rules for seller and buyer personal data.
+\end{enumerate}
+
+\section{Glossary}
+\begin{tabularx}{\textwidth}{>{\bfseries}p{31mm} X}
+\toprule
+Term & Definition\\
+\midrule
+Buyer & Consumer role for property discovery, contact access, compare, and saved homes.\\
+Seller & Owner role for submitting, editing, and uploading media to own listings.\\
+Admin & Moderation role for verifying and deactivating property listings.\\
+Profile ID & User Service \field{UserId}, carried as the JWT \field{profileId} claim.\\
+Gateway & Browser-facing HTTP path router; forwards requests to the responsible service.\\
+Internal API key & Shared service-to-service header used to protect User Service operations.\\
+Pending listing & Seller-submitted listing not yet visible to public search.\\
+Base64 image DTO & Image bytes represented as Base64 string plus declared MIME type.\\
+\bottomrule
+\end{tabularx}
+
+\vfill
+\begin{center}\small\color{ehgray}End of Low-Level Design\end{center}
+\end{document}
